@@ -5,7 +5,6 @@ import boto3
 import uuid
 import base64
 import ast
-from botocore.exceptions import ClientError
 
 from awsglue.utils import getResolvedOptions
 
