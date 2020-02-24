@@ -10,18 +10,19 @@ from awsglue.utils import getResolvedOptions
 
 
 args = getResolvedOptions(sys.argv,
-                          ['SECRET_NAME',
+                          ['SALESFORCE_URL',
+                            'SECRET_NAME',
                            'REGION_NAME',
-                           'OUTPUT_BUCKET_NAME'])
+                           'OUTPUT_BUCKET_NAME',
+                           'OBJECT_LIST'])
 
-# Create a Secrets Manager client
+# Get Secret Information 
+
 session = boto3.session.Session()
 client = session.client(
     service_name='secretsmanager',
     region_name=args['REGION_NAME']
 )
-
-# Get secrets
 
 try:
     get_secret_value_response = client.get_secret_value(
@@ -29,12 +30,14 @@ try:
     )
 except ClientError as e:
     raise e
+    quit()
 else:
     secret = get_secret_value_response['SecretString']
     secrets = ast.literal_eval(secret)
 
 
-#Get bearer token
+# Get a bearer token
+
 LOGIN_URL = "https://login.salesforce.com/services/oauth2/token"
 LOGIN_PARAMS = {'grant_type':'password', 'client_id': secrets["CLIENT_ID"], 'client_secret': secrets["CLIENT_SECRET"], 'username': secrets["USERNAME"], 'password': secrets["PASSWORD"]} 
 
@@ -44,36 +47,58 @@ if not tokenResponse.ok:
     quit()
 
 TOKEN = tokenResponse.json()["access_token"]
+
+print("Backup started")
+
+
+for object in args['OBJECT_LIST'].split(","):
+    
+    print("Processing object " + object)
+    
+    #call object describe
+    
+    describeUrl = args['SALESFORCE_URL'] + "/sobjects/"+ object +"/describe"
+    describeResponse = requests.get(url = describeUrl, headers={'Authorization': 'Bearer %s' % TOKEN}) 
+    if not describeResponse.ok:
+        print(describeResponse.json())
+        quit()
+
+    selectFields=[]
+    for field in describeResponse.json()['fields']:
+        selectFields.append(field['name'])
+
+    selectText = ','.join(selectFields)
+    
  
-URL = "https://s3-backup.my.salesforce.com/services/data/v20.0/query"
-PARAMS = {'q':'SELECT name,type from Account'} 
-response = requests.get(url = URL, params = PARAMS, headers={'Authorization': 'Bearer %s' % TOKEN}) 
-  
-# extracting data in json format 
-if not response.ok:
-    print(response.json())
-    quit()
+    #call query on object with all fields
+ 
+    queryUrl = args['SALESFORCE_URL'] + "/query"
+
+    params = {'q':'SELECT '+ selectText + ' from ' + object} 
+
+    queryResponse = requests.get(url = queryUrl, params = params, headers={'Authorization': 'Bearer %s' % TOKEN}) 
+
+
+    # prepare query results
+    if not queryResponse.ok:
+        print(queryResponse.json())
+        quit()
     
+    data = queryResponse.json()
+    resultObject={}
+    resultObject={ 'Object Name': object, 'Object Count': data["totalSize"], 'Records': data["records"]}
     
-data = response.json()
-results = []
-
-
-for result in data["records"]:
-    if result["Type"] is not None:
-        accountInfo ={}
-        accountInfo["Name"] = result["Name"]
-        accountInfo["Type"] = result["Type"]
-        results.append(accountInfo)
+    # save results to s3 bucket
     
-s3 = boto3.resource('s3')
-fileName = 'backup{}.json'.format(uuid.uuid4())
-s3object = s3.Object(args['OUTPUT_BUCKET_NAME'], fileName)
+    s3 = boto3.resource('s3')
+    fileName = 'backup-{}-{}.json'.format(object, uuid.uuid4())
+    s3object = s3.Object(args['OUTPUT_BUCKET_NAME'], fileName)
 
-s3object.put(
-    Body=(bytes(json.dumps(results).encode('UTF-8')))
-)
+    s3object.put(
+        Body=(bytes(json.dumps(resultObject).encode('UTF-8')))
+    )
 
-print('Saved file with name: {} to S3 bucket {}'.format(fileName, args['OUTPUT_BUCKET_NAME']))
+    print('Saved backup with name: {} to S3 bucket {}'.format(fileName, args['OUTPUT_BUCKET_NAME']))
 
 
+print('Backup job finished succesfully')
